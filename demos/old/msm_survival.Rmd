@@ -1,0 +1,189 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+chunk_output_type: inline
+---
+# Demo: Multi-State Models with the R package `survival` by Therneau et al. 
+## 0. Imports
+```{r imports, include=FALSE}
+library(tidyverse)
+library(survival)
+library(mstate)
+```
+
+## 1. Data Source
+We demonstrate using the MGUS2 dataset for predicting plasma cell malignancy (`pstat`) with subsequent mortality as well as death as a competing risk. 
+```{r data}
+# Import original dataset
+data(cancer, package="survival")
+
+# Initial pre-processing
+df_mgus <- mgus2 %>% 
+    # Solve ties in event times
+    mutate(ptime := ifelse(ptime==futime & pstat==1, ptime-.1, ptime)) %>%
+    # Rename and drop some columns for personal convenience
+    rename(time_pcm=ptime, status_pcm=pstat, status_death=death, time_death=futime) %>% 
+    select(id, age, sex, hgb, creat, mspike, time_pcm, status_pcm, time_death, status_death)
+head(df_mgus)
+```
+
+## 2. Prepare
+We prepare the data in two formats in three different ways. 
+ - Counting Process Format: `[id, tstart, tstop, event, ..covariates]` 
+ - Timeline Format: `[id, time, event, ..covariates]`
+
+The counting process format will be prepared the manual way or with `mstate.msprep`. The timeline format will be prepared manually only. 
+For both formats, the `event` column should be a factor with the 0th level indicating censoring. 
+
+### 2.1 Counting Process Format - Manual
+Each row is a single time interval with a starting and stopping time, corresponding to an event that took place at the stopping time. 
+ - Covariate values are taken to be the values at the beginning of each time interval given by the row. 
+ - The counting process format optionally admits an `istate` argument giving the state "from", while the `event` gives the state "to". This is essential if not everybody begins in the same initial state. 
+```{r df_counting}
+# We create the rows corresponding to event occurrences, with separate columns for each indicator initially
+df_counting <- tmerge(
+    df_mgus, df_mgus, id=id, 
+    death=event(time_death, status_death), 
+    pcm=event(time_pcm, status_pcm)
+)
+# We convert from binary indicator columns to a single factor column giving the event that occurred in each time interval
+df_counting <- tmerge(df_counting, df_counting, id, enum=cumtdc(tstart)) %>% 
+    mutate(event = ifelse(death==1, 2, pcm)) %>% 
+    mutate(event = factor(event, 0:2, labels=c("censor", "pcm", "death"))) %>% 
+    select(id, age, sex, tstart, tstop, event)
+
+tail(df_counting)
+
+# We use the survcheck method to verify that all is well
+check.counting <- survcheck(Surv(tstart, tstop, event)~ 1, id=id, df_counting)
+stopifnot(all(check.counting$flag == 0))
+```
+
+### 2.2 Counting Process Format - msprep 
+The format remains identical but now we generate the dataset using `msprep`. This may be useful in complex situations, as it allows us to define the allowed transitions with a transition matrix and then adheres to it. 
+```{r df_msbmt}
+# We define the transition matrix. Unlike in mstate, it is essential to include a censoring state.
+tmat.msprep <- transMat(list(c(2,3,4), c(3,4), c(), c()), names=c("entry", "pcm", "death", "censor"))
+
+# The original dataset has binary indicator columns and time columns for each state, exactly as needed for msprep
+# We only need to add a censoring indicator to the original dataset
+df_ms_tmp <- df_mgus %>%
+    mutate(time_censor = time_death, status_censor = ifelse(status_death == 0, 1, 0))
+
+# Call msprep with the prepared frame
+df_msbmt <- msprep(
+    data=df_ms_tmp,
+    time=c(NA, 'time_pcm', 'time_death', 'time_censor'),
+    status=c(NA, 'status_pcm', 'status_death', 'status_censor'),
+    trans=tmat.msprep,
+    id='id',
+    keep=c('age', 'sex')
+) %>% 
+    # Post-processing: Rename the time columns for consistency with df_counting above
+    rename(tstart=Tstart, tstop=Tstop) %>% 
+    # Derive the `event` factor column from msprep's `to` column giving the state we enter at the end of each interval
+    # Ensure that censoring takes the 0th level of the factor
+    mutate(event = factor(to, c(4,2,3), labels=c("censor", "pcm", "death"))) %>% 
+    # Derive `istate` (giving the initial state for each time interval) from msprep's `from` column
+    mutate(istate = factor(from, 1:4, labels=c('(s0)', 'pcm', 'death', 'censor'))) %>%
+    # msprep generates one row per transition the patient was at risk of, while survival only needs one row per transition that actually took place
+    # so we discard the rows for events that never took place 
+    filter(status==1) %>% 
+    select(id, age, sex, tstart, tstop, event, istate)
+# Remove the 'msdata' class from the resulting object for better formatting
+attr(df_msbmt, "class") <- c("data.frame")
+tail(df_msbmt)
+
+check.msbmt <- survcheck(Surv(tstart, tstop, event)~ 1, id=id, df_msbmt, istate=istate)
+stopifnot(all(check.msbmt$flag == 0))
+```
+
+### 2.3 Timeline Format
+We generate one row per event that took place. We additionally have a row at time 0 for every patient (with `event=NA`), giving their covariate values. Subsequent rows' covariate values can be left NULL, unless the covariate has an updated value at the time. 
+```{r df_timeline}
+# Helper function to generate rows for events that took place, taking the dataset from wide to long format
+add_indicator <- function(df, col_time, col_status, value) {
+    # Given the dataset frame and indicator & time columns for a specific event type
+    df_ind <- df %>% 
+        # Take all the patients who experienced the event
+        filter(.[,col_status] == 1) %>% 
+        # Generate rows in the format: ID, time, event_name
+        mutate(time=.[,col_time], event=value) %>%
+        select(id, time, event)
+    # And append these rows to the original input dataframe
+    return(merge(df, df_ind, all=TRUE))
+}
+
+df_timeline <- df_mgus %>% 
+    # Take all the existing rows (which contain covariates) to be the "index" rows, with time 0 and no event. 
+    mutate(time=0, event=NA) %>%
+    # Add a censoring indicator and time column
+    mutate(time_censor = time_death, status_censor = ifelse(status_death == 0, 1, 0)) %>% 
+    # Convert from wide to long format, adding one row per event that took place for each person
+    add_indicator('time_censor', 'status_censor', 0) %>% 
+    add_indicator('time_pcm', 'status_pcm', 1) %>% 
+    add_indicator('time_death', 'status_death', 2) %>%
+    # Convert the nunerical event indicator into a factor (with censoring as the 0th level)
+    mutate(event=factor(event, 0:2, c("censor", "pcm", "death"))) %>% 
+    select(id, age, sex, time, event)
+tail(df_timeline)
+
+check.timeline <- survcheck(Surv2(time, event) ~ 1, id=id, df_timeline)
+stopifnot(all(check.timeline$flag == 0))
+```
+
+### 2.4 Check
+All three variants should give identical transition matrices. If used to fit survival curves, they should give identical curves too. 
+```{r data_check}
+# Check 1: Identical transition matrices
+stopifnot(all.equal(check.counting$transitions, check.msbmt$transitions))
+stopifnot(all.equal(check.counting$transitions, check.timeline$transitions))
+
+# Check 2: Identical survival curves
+mfit.counting <- survfit(Surv(tstart, tstop, event) ~ sex, data=df_counting, id=id)
+mfit.msbmt <- survfit(Surv(tstart, tstop, event) ~ sex, data=df_msbmt, id=id, istate=istate)
+mfit.timeline <- survfit(Surv2(time, event) ~ sex, data=df_timeline, id=id)
+
+stopifnot(all.equal(mfit.counting$pstate, mfit.msbmt$pstate))
+stopifnot(all.equal(mfit.counting$pstate, mfit.timeline$pstate))
+```
+
+## 3. Model Fitting
+We fit multi-state Cox PH models with each of the dataset variants. 
+### 3.1 Multi-State Process
+A patient begins in the entry state. They may develop PCM and then progress to cause-specific death, or they may die from unrelated causes without developing PCM. They may also be censored at any time after entry prior to death (not shown below). 
+```{r state_figure}
+tmat.fig <- matrix(0L, 3, 3, dimnames=list(c("entry", "pcm", "death"), c("entry", "pcm", "death")))
+tmat.fig[1, 2:3] <- tmat.fig[2, 3] <- 1
+statefig(c(1, 2), tmat.fig)
+```
+### 3.2 Fitting
+We use the special `survival::Surv2` formula to accommodate the timeline format. Otherwise fitting proceeds the same as it would for a single-state model. 
+```{r coxph}
+# Cox PH models
+model.cox.counting <- coxph(Surv(tstart, tstop, event) ~ sex, data=df_counting, id=id)
+model.cox.msbmt <- coxph(Surv(tstart, tstop, event) ~ sex, data=df_msbmt, id=id, istate=istate)
+model.cox.timeline <- coxph(Surv2(time, event) ~ sex, data=df_timeline, id=id)
+```
+### 3.3 Check
+```{r coxph_check}
+# Check: All three models should yield identical coefficients
+stopifnot(all.equal(coef(model.cox.counting), coef(model.cox.msbmt)))
+stopifnot(all.equal(coef(model.cox.counting), coef(model.cox.timeline)))
+```
+
+## 4. Inference
+```{r inference}
+# Inference
+df_ndata <- expand.grid(sex=c("F", "M"), age=c(60, 80))
+
+inf.counting <- survfit(model.cox.counting, newdata=df_ndata)
+inf.msbmt <- survfit(model.cox.msbmt, newdata=df_ndata)
+# NOTE: The below doesn't work. It's a bug in the survival package itself. https://github.com/therneau/survival/issues/264
+inf.timeline <- survfit(model.cox.timeline, newdata=df_ndata)
+
+plot(inf.counting, col=1:2, xscale=365.25, xlab='Years', ylab='Survival')
+```
+
+

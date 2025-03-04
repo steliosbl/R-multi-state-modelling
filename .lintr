@@ -1,0 +1,7 @@
+linters: linters_with_defaults(
+    indentation_linter(4L),
+    trailing_whitespace_linter(allow_empty_lines = TRUE),
+    object_usage_linter = NULL,
+    commented_code_linter = NULL
+  )
+encoding: "UTF-8"

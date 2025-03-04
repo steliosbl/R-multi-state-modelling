@@ -1,0 +1,113 @@
+## 0. Setup
+```{r imports}
+library(tidyverse)
+library(survival)
+library(mstate)
+library(glue)
+```
+
+## 1. Data Source
+```{r data_sources}
+data(ebmt3)
+cols.time <- c(NA, "prtime", "rfstime")
+cols.status <- c(NA, "prstat", "rfsstat")
+cols.covariates <- c("dissub", "age", "drmatch", "tcd")
+```
+
+## 2. Prepare 
+```{r prepare}
+df_prepared <- ebmt3 %>% 
+    mutate(prtime=prtime/365.25, rfstime=rfstime/365.25)
+```
+
+## 3. Model Fitting
+### 3.1 Transition Matrix
+```{r transitions}
+model.tmat <- transMat(x = list(c(2, 3), c(3), c()), names = c("Tx", "PR", "RelDeath"))
+model.tmat 
+```
+
+### 3.2 Dataset Expansion
+```{r msprep}
+msbmt <- msprep(
+    data=df_prepared,
+    time=cols.time,
+    status=cols.status,
+    # start=list(state=df_prepared$start_state, time=df_prepared$start_time)
+    keep=cols.covariates,
+    id="id",
+    trans=model.tmat
+) %>% expand.covs(cols.covariates, append=TRUE)
+
+events(msbmt)
+```
+
+### 3.3 Cox Model Fitting
+```{r coxph}
+# Dynamically create the formula
+# cols.covariates.expanded <- unlist(lapply(cols.covariates, function(x) paste(x, 1:3, sep='.'))) # This only works with non-categorical covariates
+cols.covariates.expanded <- tail(colnames(msbmt), 18)
+model.formula <- as.formula(glue("Surv(Tstart, Tstop, status) ~ {paste(cols.covariates.expanded, collapse=' + ')} + cluster(id) + strata(trans)"))
+
+# Fit the Cox PH model
+time.start <- Sys.time()
+model.cox <- coxph(model.formula, msbmt, method='breslow')
+time.stop <- Sys.time()
+time.stop - time.start
+```
+
+## 4. Inference
+### 4.1 Prepare Inference Data
+```{r newd}
+# Utility function to expand any given record(s) from df_prepared and assign relevant classes and attributes for mstate
+expand_newd <- function(df_newd) {
+    n <- nrow(df_newd)
+    df_newd <- df_newd[rep(1:n, each=3),] %>% 
+        mutate(trans = rep(1:3, times=n), strata = rep(1:3, times=n))
+    attr(df_newd, 'trans') <- model.tmat
+    class(df_newd) <- c("msdata", class(df_newd))
+    df_newd <- expand.covs(df_newd, cols.covariates)
+    return(df_newd)
+}
+newd <- df_prepared[1:20,]
+expanded.newd <- expand_newd(newd)
+```
+
+### 4.2 Run inference
+```{r msfit}
+time.start <- Sys.time()
+vec.msf <- parallel::mclapply(1:nrow(newd), function(i) {
+    msfit(model.cox, newdata=expanded.newd[i:(i+2), ], trans=model.tmat)
+}, mc.cores=1)
+time.stop <- Sys.time()
+time.stop - time.start
+
+time.start <- Sys.time()
+vec.pt <- parallel::mclapply(vec.msf, probtrans, predt=0, mc.cores=1)
+time.stop <- Sys.time()
+time.stop - time.start
+```
+
+### 4.3 Inference Results
+```{r probtrans}
+vec.preds <- lapply(vec.pt, function(pt) pt[[1]] %>% tail(1)) %>% bind_rows()
+tail(vec.preds)
+```
+
+## 5. Evaluation
+### 5.1 Plots
+```{r plots}
+plot(vec.pt[[10]])
+```
+
+### 5.2 C-statistic
+```{r eval}
+# Start with just the Tx -> PR transition
+y_pred_proba <- vec.preds$pstate2 # Take only the predicted probas for Tx -> PR
+
+surv <- Surv(newd$prtime, newd$prstat) # Take the ground truth
+
+c_stat <- Hmisc::rcorr.cens(y_pred_proba, surv)
+c_stat['C Index']
+
+```
