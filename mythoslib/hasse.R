@@ -14,6 +14,8 @@ library(MASS)
 library(Matrix)
 library(dplyr)
 
+source("mythoslib/convert.R")
+
 # Fix MASS conflict
 select <- dplyr::select
 
@@ -448,4 +450,94 @@ hasse_covariates_longitudinal <- function(graph, walks, n) {
     attr(result_df, "trend_absent") <- trend_absent
 
     result_df
+}
+
+#' Convert walks and covariates along the Hasse graph to counting process data
+#'
+#' Given a set of random walks on the Hasse diagram and a set of covariates
+#' generated for these walks, this function converts the data to a counting
+#' process format suitable for use with the survival package.
+#'
+#' @param walks A dataframe of random walks on the Hasse diagram with columns
+#' .   \code{id, vertex, time}
+#' @param covariates A dataframe of covariates for the walks with columns:
+#' .   \code{id, C_1, C_2, ..., C_n}
+#' @param tmat The transition matrix of the Hasse diagram
+#' @return A dataframe of counting process data with columns:
+#' .   \code{id, start, stop, event, C_1, C_2, ..., C_n}
+#' .   And attribute "covariates" giving the covariate column names
+convert_hasse_counting <- function(walks, covariates, tmat, time_max = 1.0) {
+    result <- walks %>%
+        rename(event = vertex) %>%
+        # Convert to a timeline
+        augment_timeline_censoring("id", tmat, time_max, "censor") %>%
+        # Convert to counting process
+        timeline_to_counting(., "id") %>%
+        # Event columns to factors with censoring as the 1st level
+        mutate(from = factor(from), to = factor(to)) %>%
+        mutate(to = fct_relevel(as.factor(to), "censor")) %>%
+        # Augment with (time-fixed/baseline) covariate columns
+        left_join(covariates, by = "id")
+
+    # Include covariate column names as an attribute
+    cov_names <- colnames(covariates)[colnames(covariates) != "id"]
+    attr(result, "covariates") <- cov_names
+
+    result
+}
+
+#' Convert walks and covariates along the Hasse graph to mstate data
+#'
+#' Given a set of random walks on the Hasse diagram and a set of covariates
+#' generated for these walks, this function converts the data to a multi-state
+#' format suitable for use with the mstate package. Includes the call to msprep.
+#'
+#' @param walks A dataframe of random walks on the Hasse diagram with columns
+#' .   \code{id, vertex, time}
+#' @param covariates A dataframe of covariates for the walks with columns:
+#' .   \code{id, C_1, C_2, ..., C_n}
+#' @param tmat The transition matrix of the Hasse diagram
+#' @return A msdata object with columns:
+#' .   \code{id, from, to, Tstart, Tstop, time, status, C_1, C_2, ..., C_n,
+#'     C_1.1, C_2.1, C_3.1, ... C_S.1, C_2.2, ..., C_S.n}
+#' .   Includes attributes "covariates" giving the covariate column names and
+#' .   "covariates_expanded" giving for transition-specific covariate names
+convert_hasse_msdata <- function(walks, covariates, tmat, time_max = 1.0) {
+    cov_names <- colnames(covariates)[colnames(covariates) != "id"]
+
+    df_mstate <- walks %>%
+        # Convert to a timeline
+        rename(event = vertex) %>%
+        augment_timeline_censoring("id", tmat, time_max, "censor") %>%
+        # Convert to mstate format
+        timeline_to_mstate("id", tmat, "censor") %>%
+        select(-time_censor, -status_censor) %>%
+        # Augment with (time-fixed/baseline) covariate columns
+        left_join(covariates, by = "id")
+
+    # Call msprep to create msdata object
+    df_msdata <- df_mstate %>% msprep(
+        time = paste0("time_", rownames(tmat)),
+        status = paste0("status_", rownames(tmat)),
+        trans = tmat,
+        id = "id",
+        start = list(
+            time = .$itime,
+            state = match(.$istate, dimnames(tmat)[[1]])
+        ),
+        keep = cov_names
+    )
+
+    # Create the table of expanded covariates (do not join with states yet)
+    df_covs_expanded <- df_msdata %>%
+        expand.covs(cov_names, append = FALSE, longnames = TRUE)
+
+    # Join with states
+    result <- bind_cols(df_msdata, df_covs_expanded)
+
+    # Include covariate column names as attributes
+    attr(result, "covariates") <- cov_names
+    attr(result, "covariates_expanded") <- colnames(df_covs_expanded)
+
+    result
 }

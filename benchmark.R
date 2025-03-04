@@ -14,6 +14,7 @@ library(tidyverse)
 library(survival)
 library(mstate)
 library(flexsurv)
+library(qs)
 
 source("mythoslib/convert.R")
 source("mythoslib/hasse.R")
@@ -22,405 +23,302 @@ source("mythoslib/hasse.R")
 # Set seed for reproducibility
 set.seed(123)
 
-# FUNCTIONS ####################################################################
-prep_hasse_counting <- function(walks, covariates, tmat) {
-    result <- walks %>%
-        rename(event = vertex) %>%
-        augment_timeline_censoring("id", tmat, 1.0, "censor") %>%
-        timeline_to_counting(., "id") %>%
-        arrange(id, tstart) %>%
-        mutate(from = factor(from), to = factor(to)) %>%
-        mutate(to = fct_relevel(as.factor(to), "censor")) %>%
-        left_join(covariates, by = "id")
-
-    attr(result, "covariates") <- colnames(covariates)[
-        colnames(covariates) != "id"
-    ]
-
-    result
-}
-
-prep_hasse_mstate <- function(walks, covariates, tmat) {
-    cov_names <- colnames(covariates)[colnames(covariates) != "id"]
-
-    df <- walks %>%
-        rename(event = vertex) %>%
-        augment_timeline_censoring("id", tmat, 1.0, "censor") %>%
-        timeline_to_mstate("id", tmat, "censor") %>%
-        select(-time_censor, -status_censor) %>%
-        left_join(covariates, by = "id")
-
-    msdata <- msprep(
-        data = df,
-        time = paste0("time_", rownames(tmat)),
-        status = paste0("status_", rownames(tmat)),
-        trans = tmat,
-        id = "id",
-        start = list(
-            time = df$itime,
-            state = match(df$istate, dimnames(tmat)[[1]])
-        ),
-        keep = cov_names
-    )
-
-    covariates_expanded <- msdata %>%
-        expand.covs(cov_names, append = FALSE, longnames = TRUE)
-
-    result <- bind_cols(msdata, covariates_expanded)
-    attr(result, "covariates") <- cov_names
-    attr(result, "covariates_expanded") <- colnames(covariates_expanded)
-
-    result
-}
-
+# FITTING ######################################################################
 fit_survival <- function(data) {
+    # Dynamically create formula using the covariate names
     covariates <- attr(data, "covariates")
-
     formula <- as.formula(
         paste0("Surv(tstart, tstop, to) ~ ", paste(covariates, collapse = "+"))
     )
 
+    # Fit the Cox PH model, tracking how long it takes
     time_start <- Sys.time()
     model <- coxph(formula, data, istate = from, id = id)
     time_stop <- Sys.time()
+
+    # Return the model and timings
     list(
         model = model,
-        time = as.numeric(time_stop - time_start)
-    )
-}
-
-predict_survival <- function(model, newdata, tmat) {
-    newdata <- newdata %>%
-        filter(tstart == 0)
-
-    result <- by(newdata, newdata$from, function(df) {
-        p0 <- as.integer(model$states == df[1, ]$from)
-        df <- df %>% select(id, attr(newdata, "covariates"))
-
-        time_start <- Sys.time()
-        pred <- survfit(model, newdata = df, p0 = p0)
-        time_stop <- Sys.time()
-
-        list(
-            pred = pred,
-            time = time_stop - time_start
-        )
-    })
-
-    list(
-        time = sum(unlist(map(result, ~ as.numeric(.x$time)))),
-        pred = lapply(result, function(x) x$pred)
-    )
-}
-
-predict_survival_parallel <- function(model, newdata, tmat, n_cpu) {
-    # Get unique IDs and partition them into N groups
-    ids <- unique(newdata$id)
-    partitions <- split(ids, cut(seq_along(ids), n_cpu, labels = FALSE))
-
-    # Apply function in parallel
-    time_start <- Sys.time()
-    results <- parallel::mclapply(partitions, function(id_subset) {
-        subset <- newdata %>% filter(id %in% id_subset)
-        predict_survival(model, subset, tmat)
-    }, mc.cores = n_cpu)
-    time_stop <- Sys.time()
-
-    list(
-        time = as.numeric(time_stop - time_start),
-        pred = NULL
+        time = as.numeric(time_stop - time_start, units = "secs")
     )
 }
 
 fit_mstate <- function(data) {
+    # Dynamically create formula using the expanded covariate names
     covariates_expanded <- attr(data, "covariates_expanded")
-
     formula <- as.formula(paste0(
         "Surv(Tstart, Tstop, status) ~ ",
         paste(covariates_expanded, collapse = "+"),
         " + cluster(id) + strata(trans)"
     ))
 
+    # Fit the Cox PH model, tracking how long it takes
     time_start <- Sys.time()
     model <- coxph(formula, data, method = "breslow")
     time_stop <- Sys.time()
+
+    # Return the model and timings
     list(
         model = model,
-        time = as.numeric(time_stop - time_start)
+        time = as.numeric(time_stop - time_start, units = "secs")
     )
 }
 
-predict_mstate <- function(model, newdata, tmat) {
-    newdata <- newdata %>%
-        rename(strata = trans) %>%
-        select(strata, attr(newdata, "covariates_expanded"))
-
+# PREDICTION ###################################################################
+predict_survival <- function(model, data, tmat) {
     time_start <- Sys.time()
-    pred <- msfit(model, newdata, trans = tmat) %>%
-        probtrans(predt = 0) %>%
-        .[[1]]
+    # Subset according to initial state
+    pred <- by(data, data$from, function(subset) {
+        # For each initial state, compose the corresponding p0 vector
+        p0 <- as.integer(model$states == subset[1, ]$from)
+
+        # Select only the covariates
+        subset <- subset %>% select(id, attr(data, "covariates"))
+
+        # Call survfit
+        survfit(model, newdata = subset, p0 = p0)
+    })
     time_stop <- Sys.time()
 
     list(
-        time = time,
-        pred = pred
+        predictions = pred,
+        time = as.numeric(time_stop - time_start, units = "secs")
     )
 }
 
-predict_mstate_parallel <- function(model, newdata, tmat, n_cpu) {
-    # Get unique IDs and partition them into N groups
-    ids <- unique(newdata$id)
-    partitions <- split(ids, cut(seq_along(ids), n_cpu, labels = FALSE))
-
-    # Apply function in parallel
+predict_mstate <- function(model, data, tmat) {
     time_start <- Sys.time()
-    results <- parallel::mclapply(partitions, function(id_subset) {
-        subset <- newdata %>% filter(id %in% id_subset)
-        predict_mstate(model, subset, tmat)
+    pred <- msfit(object = model, newdata = data, trans = tmat) %>%
+        probtrans(predt = 0)
+    time_stop <- Sys.time()
+
+    list(
+        predictions = pred,
+        time = as.numeric(time_stop - time_start, units = "secs")
+    )
+}
+
+predict_parallel <- function(predict_func, data, n_cpu = 1) {
+    # Partition data into n_cpu total groups
+    if (n_cpu > 1) {
+        partitions <- data %>%
+            group_by(cut(seq_along(id), n_cpu, labels = FALSE)) %>%
+            group_split()
+    } else {
+        partitions <- list(data)
+    }
+
+    # Parallelise prediction over n_cpu processes
+    time_start <- Sys.time()
+    pred <- parallel::mclapply(partitions, function(partition) {
+        predict_func(partition)
     }, mc.cores = n_cpu)
     time_stop <- Sys.time()
 
+    # Return predictions and timings
     list(
-        time = as.numeric(time_stop - time_start),
-        pred = NULL
+        predictions = pred,
+        time = as.numeric(time_stop - time_start, units = "secs")
     )
 }
 
-results_out <- function(data, file = "results.csv") {
-    exists <- file.exists(file) && file.info(file)$size != 0
-    write.table(as.data.frame(data), file,
-        sep = ",", row.names = FALSE,
-        col.names = !exists, append = exists
-    )
-}
+# PIPELINES ####################################################################
+pipeline_survival <- function(walks, covariates, tmat,
+                              n_train, n_test, n_cpu = 1) {
+    # 1. Prepare the dataset
+    data <- convert_hasse_counting(walks, covariates, tmat)
+    df_train <- data %>% filter(id %in% 1:n_train)
+    df_test <- data %>%
+        filter(id %in% (n_train + 1):(n_train + n_test)) %>%
+        filter(tstart == 0)
 
-pipeline_survival <- function(n_elements, n_train, n_covs, n_test, n_cpu) {
-    g <- poset_hasse(n_elements)
-    w <- hasse_walks(g, n_train + n_test)
-    c <- hasse_covariates(g, w, n_covs)
-    tmat <- hasse_tmat(g)
-
-    df <- prep_hasse_counting(w, c, tmat)
-
-    df_train <- df %>% filter(id %in% 1:n_train)
+    # 2. Fit the model
     fit <- fit_survival(df_train)
 
+    # 3. Predict
     if (n_test > 0) {
-        df_test <- df %>% filter(id %in% (n_train + 1):(n_train + n_test))
-        if (n_cpu > 1) {
-            pred <- predict_survival_parallel(fit$model, df_test, tmat, n_cpu)
-        } else {
-            pred <- predict_survival(fit$model, df_test, tmat)
-        }
-    } else {
-        pred <- list(pred = NULL, time = 0)
+        pred <- predict_parallel(
+            function(df) predict_survival(fit$model, df, tmat),
+            df_test, n_cpu
+        )
     }
 
     list(
-        type = "survival",
         model = fit$model,
-        pred = pred$pred,
+        predictions = pred$predictions,
         time_fit = fit$time,
         time_pred = pred$time
     )
 }
 
-pipeline_mstate <- function(n_elements, n_train, n_covs, n_test, n_cpu) {
+pipeline_mstate <- function(walks, covariates, tmat,
+                            n_train, n_test, n_cpu = 1) {
+    # 1. Prepare the dataset
+    data <- convert_hasse_msdata(walks, covariates, tmat)
+
+    # Split the data into training and testing sets
+    df_train <- data %>% filter(id %in% 1:n_train)
+    df_test <- data %>%
+        filter(id %in% (n_train + 1):(n_train + n_test)) %>%
+        rename(strata = trans)
+
+    # 2. Fit the model
+    fit <- fit_mstate(df_train)
+
+    # 3. Predict
+    if (n_test > 0) {
+        pred <- predict_parallel(
+            function(df) predict_mstate(fit$model, df, tmat),
+            df_test, n_cpu
+        )
+    }
+
+    list(
+        model = fit$model,
+        pred = pred$predictions,
+        time_fit = fit$time,
+        time_pred = pred$time
+    )
+}
+
+# RUN ##########################################################################
+pipelines <- list(
+    survival = pipeline_survival,
+    mstate = pipeline_mstate
+)
+
+generate_hasse <- function(n_elements, n_covs, n_train, n_test) {
     g <- poset_hasse(n_elements)
     w <- hasse_walks(g, n_train + n_test)
     c <- hasse_covariates(g, w, n_covs)
     tmat <- hasse_tmat(g)
 
-    df <- prep_hasse_mstate(w, c, tmat)
+    list(
+        graph = g,
+        walks = w,
+        covariates = c,
+        tmat = tmat
+    )
+}
 
-    df_train <- df %>% filter(id %in% 1:n_train)
-    fit <- fit_mstate(df_train)
+bench <- function(model, n_elements, n_covs, n_train, n_test, n_cpu, n_rep) {
+    # Generate the hasse graph and associated data
+    print("Generating hasse graph.")
+    time_start <- Sys.time()
+    hasse_data <- generate_hasse(n_elements, n_covs, n_train, n_test)
+    time_stop <- Sys.time()
+    print(time_stop - time_start)
 
-    if (n_test > 0) {
-        df_test <- df %>% filter(id %in% (n_train + 1):(n_train + n_test))
-        if (n_cpu > 1) {
-            pred <- predict_mstate_parallel(fit$model, df_test, tmat, n_cpu)
-        } else {
-            pred <- predict_mstate(fit$model, df_test, tmat)
+    # Run the pipeline
+    print("Running pipeline")
+    time_start <- Sys.time()
+    result <- tryCatch(
+        {
+            pipelines[[model]](
+                hasse_data$walks,
+                hasse_data$covariates,
+                hasse_data$tmat,
+                n_train,
+                n_test,
+                n_cpu
+            )
+        },
+        error = function(e) {
+            print(conditionMessage(e))
+            list(
+                error = e,
+                error_message = conditionMessage(e),
+                hasse = hasse_data
+            )
         }
-    } else {
-        pred <- list(pred = NULL, time = 0)
+    )
+    time_stop <- Sys.time()
+    print(time_stop - time_start)
+
+    result[["parameters"]] <- list(
+        model = model,
+        n_elements = n_elements,
+        n_covs = n_covs,
+        n_train = n_train,
+        n_test = n_test,
+        n_cpu = n_cpu,
+        n_rep = n_rep
+    )
+
+    result
+}
+
+main <- function(result_dir = "data/results") {
+    # Access command line arguments
+    args <- commandArgs(trailingOnly = TRUE)
+    if (length(args) == 0) {
+        stop("No arguments provided")
     }
 
-    list(
-        type = "mstate",
-        model = fit$model,
-        pred = pred$pred,
-        time_fit = fit$time,
-        time_pred = pred$time
-    )
+    # Obtain test type
+    test_type <- args[1]
+
+    # Obtain model type
+    model <- args[2]
+    if (!(model %in% c("survival", "mstate"))) {
+        stop(paste("Invalid model type", model))
+    }
+
+    # Obtain number of elements
+    n_elements <- as.integer(args[3])
+    if (is.na(n_elements) || n_elements < 2) {
+        stop(paste("Invalid number of elements", n_elements))
+    }
+
+    # Obtain number of covariates
+    n_covs <- as.integer(args[4])
+    if (is.na(n_covs) || n_covs < 1) {
+        stop(paste("Invalid number of covariates", n_covs))
+    }
+
+    # Obtain number of training and testing samples
+    n_train <- as.integer(args[5])
+    n_test <- as.integer(args[6])
+    if (is.na(n_train) || is.na(n_test) || n_train < 1 || n_test > n_train) {
+        stop(paste("Invalid number of samples", n_train, "/", n_test))
+    }
+
+    # Obtain number of CPU cores
+    n_cpu <- as.integer(args[7])
+    if (is.na(n_cpu) || n_cpu < 1) {
+        stop(paste("Invalid number of CPU cores", n_cpu))
+    }
+
+    # Obtain number of repetitions
+    n_rep <- as.integer(args[8])
+    if (is.na(n_rep) || n_rep < 1) {
+        stop(paste("Invalid repetition number", n_rep))
+    }
+
+    # Print parameters
+    print("Parameters:")
+    print(paste(
+        "Test type:", test_type, "Model:", model, "Elements:", n_elements,
+        "Covariates:", n_covs, "Train:", n_train, "Test:", n_test,
+        "CPUs:", n_cpu, "Reps:", n_rep,
+        sep = " "
+    ))
+
+    # Run the benchmark
+    result <- bench(model, n_elements, n_covs, n_train, n_test, n_cpu, n_rep)
+
+    # Save the results
+    print("Saving results")
+    if (!dir.exists(result_dir)) {
+        dir.create(result_dir, recursive = TRUE)
+    }
+    filename <- file.path(result_dir, paste(
+        "results_", test_type, "_", model, "_", n_elements, "_",
+        n_covs, "_", n_train, "_", n_test, "_", n_cpu, "_", n_rep, ".qs",
+        sep = ""
+    ))
+    qsave(result, filename)
+    print("Done")
 }
 
-pipeline <- list(
-    "survival" = pipeline_survival,
-    "mstate" = pipeline_mstate
-)
-
-# RUN ##########################################################################
-
-# Test 1 - Fixed Testing Static Training #######################################
-test1 <- function(n_elements, n_covs, n_test, n_rep = 3) {
-    param_models <- c("survival", "mstate")
-    param_n_train <- c(2^8, 2^9, 2^10, 2^11)
-    param_n_rep <- 1:n_rep
-
-    param_grid <- expand.grid(
-        test = "1",
-        model = param_models,
-        n_elements = n_elements,
-        n_train = param_n_train,
-        n_covs = n_covs,
-        n_test = n_test,
-        n_cpu = 1,
-        n_rep = param_n_rep
-    )
-
-    params <- list(
-        model = "survival",
-        n_elements = 4,
-        n_train = 1024,
-        n_covs = 8,
-        n_test = 16,
-        n_cpu = 1,
-        n_rep = 1
-    )
-
-    lapply(seq_len(nrow(param_grid)), function(i) {
-        params <- param_grid[i, ]
-        print(params)
-        tryCatch(
-            {
-                result <- pipeline[[params$model]](
-                    n_elements = params$n_elements,
-                    n_train = params$n_train,
-                    n_covs = params$n_covs,
-                    n_test = params$n_test,
-                    n_cpu = params$n_cpu
-                )
-            },
-            error = function(e) {
-                result <- list(
-                    time_fit = -1,
-                    time_pred = -1
-                )
-            }
-        )
-
-        output <- c(
-            params,
-            list(
-                time_fit = result$time_fit,
-                time_pred = result$time_pred
-            )
-        )
-
-        results_out(output)
-    })
-}
-
-# Test 2 - Fit Scaling  ########################################################
-test2 <- function(n_rep = 3) {
-    param_models <- c("survival", "mstate")
-    param_n_elements <- c(3, 4, 5)
-    param_n_train <- c(2^9, 2^10, 2^11, 2^12, 2^13, 2^14, 2^15)
-    param_n_covs <- c(2, 4, 8, 16)
-    param_n_rep <- 1:n_rep
-
-    param_grid <- expand.grid(
-        test = "2",
-        model = param_models,
-        n_elements = param_n_elements,
-        n_train = param_n_train,
-        n_covs = param_n_covs,
-        n_test = 0,
-        n_cpu = 1,
-        n_rep = param_n_rep
-    )
-
-    lapply(seq_len(nrow(param_grid)), function(i) {
-        params <- param_grid[i, ]
-        print(params)
-        tryCatch(
-            {
-                result <- pipeline[[params$model]](
-                    n_elements = params$n_elements,
-                    n_train = params$n_train,
-                    n_covs = params$n_covs,
-                    n_test = params$n_test,
-                    n_cpu = params$n_cpu
-                )
-            },
-            error = function(e) {
-                result <- list(
-                    time_fit = NULL,
-                    time_pred = NULL
-                )
-            }
-        )
-
-        output <- c(
-            params,
-            list(
-                time_fit = result$time_fit,
-                time_pred = result$time_pred
-            )
-        )
-
-        results_out(output)
-    })
-}
-
-# Test 3 - Predict Parallelisation  ############################################
-test3 <- function(n_elements = 3, n_train = 2^13, n_covs = 4, n_rep = 3) {
-    param_models <- c("survival", "mstate")
-    param_n_test <- c(2^4, 2^5, 2^6, 2^7, 2^8)
-    param_n_cpu <- c(2^0, 2^1, 2^2, 2^3, 2^4)
-    param_n_rep <- 1:n_rep
-
-    param_grid <- expand.grid(
-        test = "3",
-        model = param_models,
-        n_elements = n_elements,
-        n_train = n_train,
-        n_covs = n_covs,
-        n_test = param_n_test,
-        n_cpu = param_n_cpu,
-        n_rep = param_n_rep
-    ) %>% arrange(n_test)
-
-    lapply(seq_len(nrow(param_grid)), function(i) {
-        params <- param_grid[i, ]
-        print(params)
-        result <- list(
-            time_fit = -1,
-            time_pred = -1
-        )
-        tryCatch(
-            {
-                result <- pipeline[[params$model]](
-                    n_elements = params$n_elements,
-                    n_train = params$n_train,
-                    n_covs = params$n_covs,
-                    n_test = params$n_test,
-                    n_cpu = params$n_cpu
-                )
-            },
-            error = function(e) NULL
-        )
-
-        output <- c(
-            params,
-            list(
-                time_fit = result$time_fit,
-                time_pred = result$time_pred
-            )
-        )
-
-        results_out(output)
-    })
-}
+main()
