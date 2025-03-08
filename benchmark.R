@@ -248,7 +248,7 @@ bench <- function(model, n_elements, n_covs, n_train, n_test, n_cpu, n_rep) {
     result
 }
 
-main <- function(result_dir = "data/results") {
+main <- function(result_dir = "data/results", model_dir = "data/models") {
     # Access command line arguments
     args <- commandArgs(trailingOnly = TRUE)
     if (length(args) == 0) {
@@ -307,17 +307,26 @@ main <- function(result_dir = "data/results") {
     # Run the benchmark
     result <- bench(model, n_elements, n_covs, n_train, n_test, n_cpu, n_rep)
 
+    print(paste("Time fit:", result$time_fit, "Time pred:", result$time_pred))
     # Save the results
     print("Saving results")
     if (!dir.exists(result_dir)) {
         dir.create(result_dir, recursive = TRUE)
     }
-    filename <- file.path(result_dir, paste(
+    if (!dir.exists(model_dir)) {
+        dir.create(model_dir, recursive = TRUE)
+    }
+    filename <- paste(
         "results_", test_type, "_", model, "_", n_elements, "_",
-        n_covs, "_", n_train, "_", n_test, "_", n_cpu, "_", n_rep, ".qs",
+        n_covs, "_", n_train, "_", n_test, "_", n_cpu, "_", n_rep,
         sep = ""
-    ))
-    qsave(result, filename)
+    )
+    write_csv(data.frame(list(
+        parameters = result$parameters,
+        time_fit = result$time_fit,
+        time_pred = result$time_pred
+    )), file.path(result_dir, paste0(filename, ".csv")))
+    qsave(result, file.path(model_dir, paste0(filename, ".qs")))
     print("Done")
 }
 
