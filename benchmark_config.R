@@ -41,6 +41,9 @@ test3 <- function() {
 }
 
 export_tsv <- function(param_grid, out_name, out_dir = "data/config") {
+    if (!dir.exists(out_dir)) {
+        dir.create(out_dir, recursive = TRUE)
+    }
     out_path <- file.path(out_dir, out_name)
     write.table(param_grid, out_path, sep = "\t", row.names = FALSE)
 }
