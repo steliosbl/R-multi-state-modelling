@@ -37,7 +37,33 @@ test2 <- function(out_name = "bench_test2.tsv") {
 
 # Test 3 - Prediction Parallelism ##############################################
 test3 <- function() {
+    n_test <- c(2^4, 2^5, 2^6, 2^7, 2^8, 2^9, 2^10)
+    n_cpu <- c(2^0, 2^1, 2^2, 2^3, 2^4, 2^5, 2^6)
 
+    fixed_params <- list(
+        test = "3",
+        model = c("survival", "mstate"),
+        n_elements = 2:3,
+        n_covariates = 4,
+        n_train = 2^13,
+        rep = 1:3
+    )
+
+    param_grids <- list()
+    for (i in seq_along(n_test)) {
+        param_grids[[i]] <- do.call(
+            expand.grid,
+            c(
+                fixed_params,
+                n_test = n_test[i],
+                n_cpu = n_cpu[i]
+            )
+        ) %>%
+            arrange(n_train) %>%
+            mutate(row = row_number()) %>%
+            select(row, everything())
+    }
+    param_grids
 }
 
 export_tsv <- function(param_grid, out_name, out_dir = "data/config") {
@@ -50,3 +76,7 @@ export_tsv <- function(param_grid, out_name, out_dir = "data/config") {
 
 export_tsv(test1(), "bench_test1.tsv")
 export_tsv(test2(), "bench_test2.tsv")
+parallel_param_grids <- test3()
+lapply(seq_along(parallel_param_grids), function(i) {
+    export_tsv(parallel_param_grids[[i]], glue("bench_test3_{2^(i-1)}.tsv"))
+})
