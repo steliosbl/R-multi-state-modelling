@@ -104,6 +104,10 @@ predict_parallel <- function(predict_func, data, n_cpu = 1) {
         partitions <- data %>%
             group_by(cut(seq_along(id), n_cpu, labels = FALSE)) %>%
             group_split()
+        partitions <- lapply(partitions, function(partition) {
+            attr(partition, "covariates") <- attr(data, "covariates")
+            partition
+        })
     } else {
         partitions <- list(data)
     }
@@ -141,6 +145,8 @@ pipeline_survival <- function(walks, covariates, tmat,
             function(df) predict_survival(fit$model, df, tmat),
             df_test, n_cpu
         )
+    } else {
+        pred <- list(predictions = NULL, time = 0)
     }
 
     list(
@@ -171,6 +177,8 @@ pipeline_mstate <- function(walks, covariates, tmat,
             function(df) predict_mstate(fit$model, df, tmat),
             df_test, n_cpu
         )
+    } else {
+        pred <- list(predictions = NULL, time = 0)
     }
 
     list(
@@ -256,10 +264,10 @@ main <- function(result_dir = "data/results", model_dir = "data/models") {
     }
 
     # Obtain test type
-    test_type <- args[1]
+    test_type <- noquote(args[1])
 
     # Obtain model type
-    model <- args[2]
+    model <- noquote(args[2])
     if (!(model %in% c("survival", "mstate"))) {
         stop(paste("Invalid model type", model))
     }
