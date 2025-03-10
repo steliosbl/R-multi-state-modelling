@@ -7,12 +7,12 @@ def print_file(n_cpu, n_jobs, filename="msm_benchmark_parallel.slurm"):
     template_params = f"""#!/bin/bash
 #SBATCH --job-name=t3_{n_cpu} # Job name
 #SBATCH --output=data/out/t3_{n_cpu}_%a.out   # Standard output and error log
-#SBATCH --time=01:00:00                 # Time limit hrs:min:sec
-#SBATCH --partition=icelake             # Partition to submit to
+#SBATCH --time=02:00:00                 # Time limit hrs:min:sec
+#SBATCH --partition=icelake-himem             # Partition to submit to
 #SBATCH --ntasks=1                      # Number of tasks (processes)
 #SBATCH --nodes=1                       # Number of nodes
 #SBATCH --cpus-per-task={n_cpu}         # Number of CPU cores per task
-#SBATCH --mem=24000                     # Memory per node in MB
+#SBATCH --mem={6760*n_cpu}              # Memory per node in MB
 #SBATCH --mail-type=BEGIN,FAIL,END      # Notifications for job done & fail
 #SBATCH --mail-user=sb2690@cam.ac.uk    # Email to which notifications are sent
 #SBATCH --account=AMWOOD-SL3-CPU        # Account name
@@ -32,22 +32,23 @@ pntest=$(awk -v ArrayTaskID=$SLURM_ARRAY_TASK_ID '$1==ArrayTaskID {print $7}' $c
 pncpu=$(awk -v ArrayTaskID=$SLURM_ARRAY_TASK_ID '$1==ArrayTaskID {print $8}' $config)
 prep=$(awk -v ArrayTaskID=$SLURM_ARRAY_TASK_ID '$1==ArrayTaskID {print $9}' $config)
 
+cd /rds/user/sb2690/hpc-work/R-multi-state-modelling
 source ~/.bashrc
 module load R/4.3.1-icelake
 micromamba activate msm
-Rscript /rds/user/sb2690/hpc-work/R-multi-state-modelling/benchmark.R ${ptest} ${pmodel} ${pnelements} ${pncovariates} ${pntrain} ${pntest} ${pncpu} ${prep}
+Rscript benchmark.R ${ptest} ${pmodel} ${pnelements} ${pncovariates} ${pntrain} ${pntest} ${pncpu} ${prep}
 """
     with open(filename, "w") as file:
         file.write(template_params)
         file.write(template_body)
 
 
-config_dir = Path("data/config")
+config_dir = Path("/rds/user/sb2690/hpc-work/R-multi-state-modelling/data/config")
 configs = [_ for _ in os.listdir(config_dir) if _.endswith(".tsv") and "test3_" in _]
 for config in configs:
     contents = pd.read_csv(config_dir / config, sep="\t")
     n_jobs = contents.shape[0]
     n_cpu = contents["n_cpu"].unique()[0]
-    print_file(n_cpu, n_jobs)
 
+    print_file(n_cpu, n_jobs)
     os.system("sbatch msm_benchmark_parallel.slurm")
