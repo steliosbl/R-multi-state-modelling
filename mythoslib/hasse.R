@@ -497,12 +497,14 @@ convert_hasse_counting <- function(walks, covariates, tmat, time_max = 1.0) {
 #' @param covariates A dataframe of covariates for the walks with columns:
 #' .   \code{id, C_1, C_2, ..., C_n}
 #' @param tmat The transition matrix of the Hasse diagram
+#' @param time_max The maximum time to consider for each walk
+#' @param expand Whether to expand the covariates to transition-specific columns
 #' @return A msdata object with columns:
 #' .   \code{id, from, to, Tstart, Tstop, time, status, C_1, C_2, ..., C_n,
 #'     C_1.1, C_2.1, C_3.1, ... C_S.1, C_2.2, ..., C_S.n}
 #' .   Includes attributes "covariates" giving the covariate column names and
 #' .   "covariates_expanded" giving for transition-specific covariate names
-convert_hasse_msdata <- function(walks, covariates, tmat, time_max = 1.0) {
+convert_hasse_msdata <- function(walks, covariates, tmat, time_max = 1.0, expand = TRUE) {
     cov_names <- colnames(covariates)[colnames(covariates) != "id"]
 
     df_mstate <- walks %>%
@@ -528,6 +530,11 @@ convert_hasse_msdata <- function(walks, covariates, tmat, time_max = 1.0) {
         keep = cov_names
     )
 
+    if (!expand) {
+        attr(df_msdata, "covariates") <- cov_names
+        return(df_msdata)
+    }
+    
     # Create the table of expanded covariates (do not join with states yet)
     df_covs_expanded <- df_msdata %>%
         expand.covs(cov_names, append = FALSE, longnames = TRUE)

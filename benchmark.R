@@ -26,9 +26,9 @@ set.seed(123)
 # FITTING ######################################################################
 fit_survival <- function(data) {
     # Dynamically create formula using the covariate names
-    covariates <- attr(data, "covariates")
+    covs <- attr(data, "covariates")
     formula <- as.formula(
-        paste0("Surv(tstart, tstop, to) ~ ", paste(covariates, collapse = "+"))
+        paste0("Surv(tstart, tstop, to) ~ ", paste(covs, collapse = "+"))
     )
 
     # Fit the Cox PH model, tracking how long it takes
@@ -45,10 +45,10 @@ fit_survival <- function(data) {
 
 fit_mstate <- function(data) {
     # Dynamically create formula using the expanded covariate names
-    covariates_expanded <- attr(data, "covariates_expanded")
+    covs_expanded <- attr(data, "covariates_expanded")
     formula <- as.formula(paste0(
         "Surv(Tstart, Tstop, status) ~ ",
-        paste(covariates_expanded, collapse = "+"),
+        paste(covs_expanded, collapse = "+"),
         " + cluster(id) + strata(trans)"
     ))
 
@@ -58,6 +58,34 @@ fit_mstate <- function(data) {
     time_stop <- Sys.time()
 
     # Return the model and timings
+    list(
+        model = model,
+        time = as.numeric(time_stop - time_start, units = "secs")
+    )
+}
+
+fit_flexsurv <- function(data, tmat) {
+    # Dynamically create formula using the covariate names
+    covs <- attr(data, "covariates")
+    formula <- as.formula(
+        paste0("Surv(Tstart, Tstop, status) ~ ", paste(covs, collapse = "+"))
+    )
+
+    # Identify the unique transitions
+    transitions <- tmat[!is.na(tmat)]
+
+    time_start <- Sys.time()
+    # Create cause-specific models
+    models <- by(data, data$trans, function(subset) {
+        flexsurvspline(
+            formula, 
+            data = subset,
+            k = 2
+        )
+    })
+    model <- do.call(fmsm, c(models, list(trans=tmat)))
+    time_stop <- Sys.time()
+
     list(
         model = model,
         time = as.numeric(time_stop - time_start, units = "secs")
@@ -90,6 +118,25 @@ predict_mstate <- function(model, data, tmat) {
     time_start <- Sys.time()
     pred <- msfit(object = model, newdata = data, trans = tmat) %>%
         probtrans(predt = 0)
+    time_stop <- Sys.time()
+
+    list(
+        predictions = pred,
+        time = as.numeric(time_stop - time_start, units = "secs")
+    )
+}
+
+predict_flexsurv <- function(model, data, tmat, tgrid) {
+    time_start <- Sys.time()
+    pred <- lapply(1:nrow(data), function(row) {
+        pmatrix.fs(
+            model,
+            newdata = data[row,], 
+            trans = tmat,
+            t = tgrid,
+            tidy = TRUE
+        )
+    })
     time_stop <- Sys.time()
 
     list(
@@ -189,22 +236,62 @@ pipeline_mstate <- function(walks, covariates, tmat,
     )
 }
 
+pipeline_flexsurv <- function(walks, covariates, tmat,
+                            n_train, n_test, n_cpu = 1) {
+    # 1. Prepare the dataset
+    data <- convert_hasse_msdata(walks, covariates, tmat, expand = FALSE)
+
+    # Split the data into training and testing sets
+    df_train <- data %>% filter(id %in% 1:n_train)
+    df_test <- data %>%
+        filter(id %in% (n_train + 1):(n_train + n_test)) %>%
+        filter(Tstart == 0)
+
+    # Obtain the time grid for prediction
+    tgrid <- df_train %>% 
+        filter(status == 1) %>% 
+        pull(Tstop) %>% 
+        unique() %>% 
+        sort
+
+    # 2. Fit the model
+    fit <- fit_flexsurv(df_train, tmat)
+
+    # 3. Predict
+    if (n_test > 0) {
+        pred <- predict_parallel(
+            function(df) predict_flexsurv(fit$model, df, tmat, tgrid),
+            df_test, n_cpu
+        )
+    } else {
+        pred <- list(predictions = NULL, time = 0)
+    }
+
+    list(
+        model = fit$model,
+        pred = pred$predictions,
+        time_fit = fit$time,
+        time_pred = pred$time
+    )
+}
+
 # RUN ##########################################################################
 pipelines <- list(
     survival = pipeline_survival,
-    mstate = pipeline_mstate
+    mstate = pipeline_mstate,
+    flexsurv = pipeline_flexsurv
 )
 
 generate_hasse <- function(n_elements, n_covs, n_train, n_test) {
-    g <- poset_hasse(n_elements)
-    w <- hasse_walks(g, n_train + n_test)
-    c <- hasse_covariates(g, w, n_covs)
-    tmat <- hasse_tmat(g)
+    graph <- poset_hasse(n_elements)
+    walks <- hasse_walks(graph, n_train + n_test)
+    covariates <- hasse_covariates(graph, walks, n_covs)
+    tmat <- hasse_tmat(graph)
 
     list(
-        graph = g,
-        walks = w,
-        covariates = c,
+        graph = graph,
+        walks = walks,
+        covariates = covariates,
         tmat = tmat
     )
 }
