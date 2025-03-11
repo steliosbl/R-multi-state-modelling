@@ -78,12 +78,12 @@ fit_flexsurv <- function(data, tmat) {
     # Create cause-specific models
     models <- by(data, data$trans, function(subset) {
         flexsurvspline(
-            formula, 
+            formula,
             data = subset,
             k = 2
         )
     })
-    model <- do.call(fmsm, c(models, list(trans=tmat)))
+    model <- do.call(fmsm, c(models, list(trans = tmat)))
     time_stop <- Sys.time()
 
     list(
@@ -128,10 +128,10 @@ predict_mstate <- function(model, data, tmat) {
 
 predict_flexsurv <- function(model, data, tmat, tgrid) {
     time_start <- Sys.time()
-    pred <- lapply(1:nrow(data), function(row) {
+    pred <- lapply(seq_len(nrow(data)), function(row) {
         pmatrix.fs(
             model,
-            newdata = data[row,], 
+            newdata = data[row, ],
             trans = tmat,
             t = tgrid,
             tidy = TRUE
@@ -237,7 +237,7 @@ pipeline_mstate <- function(walks, covariates, tmat,
 }
 
 pipeline_flexsurv <- function(walks, covariates, tmat,
-                            n_train, n_test, n_cpu = 1) {
+                              n_train, n_test, n_cpu = 1) {
     # 1. Prepare the dataset
     data <- convert_hasse_msdata(walks, covariates, tmat, expand = FALSE)
 
@@ -248,11 +248,11 @@ pipeline_flexsurv <- function(walks, covariates, tmat,
         filter(Tstart == 0)
 
     # Obtain the time grid for prediction
-    tgrid <- df_train %>% 
-        filter(status == 1) %>% 
-        pull(Tstop) %>% 
-        unique() %>% 
-        sort
+    tgrid <- df_train %>%
+        filter(status == 1) %>%
+        pull(Tstop) %>%
+        unique() %>%
+        sort()
 
     # 2. Fit the model
     fit <- fit_flexsurv(df_train, tmat)
@@ -355,7 +355,7 @@ main <- function(result_dir = "data/results", model_dir = "data/models") {
 
     # Obtain model type
     model <- noquote(args[2])
-    if (!(model %in% c("survival", "mstate"))) {
+    if (!(model %in% c("survival", "mstate", "flexsurv"))) {
         stop(paste("Invalid model type", model))
     }
 
