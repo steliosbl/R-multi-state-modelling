@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=t1       # Job name
-#SBATCH --output=data/out/t1_%a.out  # Standard output and error log
+#SBATCH --job-name=t4       # Job name
+#SBATCH --output=data/out/t4_%a.out  # Standard output and error log
 #SBATCH --time=02:30:00                      # Time limit hrs:min:sec
 #SBATCH --partition=icelake-himem            # Partition to submit to
 #SBATCH --ntasks=1                           # Number of tasks (processes)
@@ -10,10 +10,10 @@
 #SBATCH --mail-type=BEGIN,FAIL,END           # Notifications for job done & fail
 #SBATCH --mail-user=sb2690@cam.ac.uk         # Email to which notifications are sent
 #SBATCH --account=AMWOOD-SL3-CPU             # Account name
-#SBATCH --array=1-162                         # Array of jobs
+#SBATCH --array=1-576                        # Array of jobs
 
 # Specify the path to the config file
-config=/rds/user/sb2690/hpc-work/R-multi-state-modelling/data/config/bench_test1.tsv
+config=/rds/user/sb2690/hpc-work/R-multi-state-modelling/data/config/bench_test2.tsv
 
 # Extract the parameters for the current $SLURM_ARRAY_TASK_ID
 ptest=$(awk -v ArrayTaskID=$SLURM_ARRAY_TASK_ID '$1==ArrayTaskID {print $2}' $config)

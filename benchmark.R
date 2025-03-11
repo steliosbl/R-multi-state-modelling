@@ -10,6 +10,7 @@
 #
 # SETUP ########################################################################
 # Load required libraries
+
 library(tidyverse)
 library(survival)
 library(mstate)
@@ -64,7 +65,7 @@ fit_mstate <- function(data) {
     )
 }
 
-fit_flexsurv <- function(data, tmat) {
+fit_flexsurv <- function(data, tmat, knots = 2) {
     # Dynamically create formula using the covariate names
     covs <- attr(data, "covariates")
     formula <- as.formula(
@@ -80,7 +81,7 @@ fit_flexsurv <- function(data, tmat) {
         flexsurvspline(
             formula,
             data = subset,
-            k = 2
+            k = knots
         )
     })
     model <- do.call(fmsm, c(models, list(trans = tmat)))
@@ -88,7 +89,8 @@ fit_flexsurv <- function(data, tmat) {
 
     list(
         model = model,
-        time = as.numeric(time_stop - time_start, units = "secs")
+        time = as.numeric(time_stop - time_start, units = "secs"),
+        knots = knots
     )
 }
 
@@ -145,11 +147,11 @@ predict_flexsurv <- function(model, data, tmat, tgrid) {
     )
 }
 
-predict_parallel <- function(predict_func, data, n_cpu = 1) {
-    # Partition data into n_cpu total groups
-    if (n_cpu > 1) {
+predict_parallel <- function(predict_func, data, cpus = 1) {
+    # Partition data into $cpus total groups
+    if (cpus > 1) {
         partitions <- data %>%
-            group_by(cut(seq_along(id), n_cpu, labels = FALSE)) %>%
+            group_by(cut(seq_along(id), cpus, labels = FALSE)) %>%
             group_split()
         partitions <- lapply(partitions, function(partition) {
             attr(partition, "covariates") <- attr(data, "covariates")
@@ -159,11 +161,11 @@ predict_parallel <- function(predict_func, data, n_cpu = 1) {
         partitions <- list(data)
     }
 
-    # Parallelise prediction over n_cpu processes
+    # Parallelise prediction over $cpus processes
     time_start <- Sys.time()
     pred <- parallel::mclapply(partitions, function(partition) {
         predict_func(partition)
-    }, mc.cores = n_cpu)
+    }, mc.cores = cpus)
     time_stop <- Sys.time()
 
     # Return predictions and timings
@@ -175,7 +177,7 @@ predict_parallel <- function(predict_func, data, n_cpu = 1) {
 
 # PIPELINES ####################################################################
 pipeline_survival <- function(walks, covariates, tmat,
-                              n_train, n_test, n_cpu = 1) {
+                              n_train, n_test, cpus = 1) {
     # 1. Prepare the dataset
     data <- convert_hasse_counting(walks, covariates, tmat)
     df_train <- data %>% filter(id %in% 1:n_train)
@@ -190,7 +192,7 @@ pipeline_survival <- function(walks, covariates, tmat,
     if (n_test > 0) {
         pred <- predict_parallel(
             function(df) predict_survival(fit$model, df, tmat),
-            df_test, n_cpu
+            df_test, cpus
         )
     } else {
         pred <- list(predictions = NULL, time = 0)
@@ -205,7 +207,7 @@ pipeline_survival <- function(walks, covariates, tmat,
 }
 
 pipeline_mstate <- function(walks, covariates, tmat,
-                            n_train, n_test, n_cpu = 1) {
+                            n_train, n_test, cpus = 1) {
     # 1. Prepare the dataset
     data <- convert_hasse_msdata(walks, covariates, tmat)
 
@@ -216,13 +218,14 @@ pipeline_mstate <- function(walks, covariates, tmat,
         rename(strata = trans)
 
     # 2. Fit the model
+
     fit <- fit_mstate(df_train)
 
     # 3. Predict
     if (n_test > 0) {
         pred <- predict_parallel(
             function(df) predict_mstate(fit$model, df, tmat),
-            df_test, n_cpu
+            df_test, cpus
         )
     } else {
         pred <- list(predictions = NULL, time = 0)
@@ -237,7 +240,7 @@ pipeline_mstate <- function(walks, covariates, tmat,
 }
 
 pipeline_flexsurv <- function(walks, covariates, tmat,
-                              n_train, n_test, n_cpu = 1) {
+                              n_train, n_test, cpus = 1) {
     # 1. Prepare the dataset
     data <- convert_hasse_msdata(walks, covariates, tmat, expand = FALSE)
 
@@ -254,14 +257,32 @@ pipeline_flexsurv <- function(walks, covariates, tmat,
         unique() %>%
         sort()
 
-    # 2. Fit the model
-    fit <- fit_flexsurv(df_train, tmat)
+    # 2. Fit the model - iterating K downwards until convergence
+    k <- 5
+    while (k > 0) {
+        tryCatch(
+            {
+                print(paste("Fitting flexsurvspline with", k, "knots"))
+                fit <- fit_flexsurv(df_train, tmat, knots = k)
+                break
+            },
+            error = function(e) {
+                msg <- conditionMessage(e)
+                err_vmin <- grepl("initial value in 'vmmin' is not finite", msg)
+                if (!err_vmin || k == 1) {
+                    stop(e)
+                }
+                print(msg)
+            }
+        )
+        k <- k - 1
+    }
 
     # 3. Predict
     if (n_test > 0) {
         pred <- predict_parallel(
             function(df) predict_flexsurv(fit$model, df, tmat, tgrid),
-            df_test, n_cpu
+            df_test, cpus
         )
     } else {
         pred <- list(predictions = NULL, time = 0)
@@ -271,7 +292,8 @@ pipeline_flexsurv <- function(walks, covariates, tmat,
         model = fit$model,
         pred = pred$predictions,
         time_fit = fit$time,
-        time_pred = pred$time
+        time_pred = pred$time,
+        knits = fit$knots
     )
 }
 
@@ -282,9 +304,9 @@ pipelines <- list(
     flexsurv = pipeline_flexsurv
 )
 
-generate_hasse <- function(n_elements, n_covs, n_train, n_test) {
-    graph <- poset_hasse(n_elements)
-    walks <- hasse_walks(graph, n_train + n_test)
+generate_hasse <- function(elements, n_covs, n_train, n_test, times) {
+    graph <- poset_hasse(elements)
+    walks <- hasse_walks(graph, n_train + n_test, times)
     covariates <- hasse_covariates(graph, walks, n_covs)
     tmat <- hasse_tmat(graph)
 
@@ -296,11 +318,11 @@ generate_hasse <- function(n_elements, n_covs, n_train, n_test) {
     )
 }
 
-bench <- function(model, n_elements, n_covs, n_train, n_test, n_cpu, n_rep) {
+bench <- function(model, elements, n_covs, n_train, n_test, times, cpus, rep) {
     # Generate the hasse graph and associated data
     print("Generating hasse graph.")
     time_start <- Sys.time()
-    hasse_data <- generate_hasse(n_elements, n_covs, n_train, n_test)
+    hasse_data <- generate_hasse(elements, n_covs, n_train, n_test, times)
     time_stop <- Sys.time()
     print(time_stop - time_start)
 
@@ -315,7 +337,7 @@ bench <- function(model, n_elements, n_covs, n_train, n_test, n_cpu, n_rep) {
                 hasse_data$tmat,
                 n_train,
                 n_test,
-                n_cpu
+                cpus
             )
         },
         error = function(e) {
@@ -332,12 +354,13 @@ bench <- function(model, n_elements, n_covs, n_train, n_test, n_cpu, n_rep) {
 
     result[["parameters"]] <- list(
         model = model,
-        n_elements = n_elements,
+        elements = elements,
         n_covs = n_covs,
         n_train = n_train,
         n_test = n_test,
-        n_cpu = n_cpu,
-        n_rep = n_rep
+        times = times,
+        cpus = cpus,
+        rep = rep
     )
 
     result
@@ -360,9 +383,9 @@ main <- function(result_dir = "data/results", model_dir = "data/models") {
     }
 
     # Obtain number of elements
-    n_elements <- as.integer(args[3])
-    if (is.na(n_elements) || n_elements < 2) {
-        stop(paste("Invalid number of elements", n_elements))
+    elements <- as.integer(args[3])
+    if (is.na(elements) || elements < 2) {
+        stop(paste("Invalid number of elements", elements))
     }
 
     # Obtain number of covariates
@@ -378,29 +401,39 @@ main <- function(result_dir = "data/results", model_dir = "data/models") {
         stop(paste("Invalid number of samples", n_train, "/", n_test))
     }
 
+    # Obtain number of distinct event times
+    # Allow -1 to indicate arbitrary event times
+    times <- as.integer(args[7])
+    if (is.na(times) || !(times > 0 || times == -1)) {
+        stop(paste("Invalid number of event times", times))
+    }
+
     # Obtain number of CPU cores
-    n_cpu <- as.integer(args[7])
-    if (is.na(n_cpu) || n_cpu < 1) {
-        stop(paste("Invalid number of CPU cores", n_cpu))
+    cpus <- as.integer(args[8])
+    if (is.na(cpus) || cpus < 1) {
+        stop(paste("Invalid number of CPU cores", cpus))
     }
 
     # Obtain number of repetitions
-    n_rep <- as.integer(args[8])
-    if (is.na(n_rep) || n_rep < 1) {
-        stop(paste("Invalid repetition number", n_rep))
+    rep <- as.integer(args[9])
+    if (is.na(rep) || rep < 1) {
+        stop(paste("Invalid repetition number", rep))
     }
 
     # Print parameters
     print("Parameters:")
     print(paste(
-        "Test type:", test_type, "Model:", model, "Elements:", n_elements,
+        "Test type:", test_type, "Model:", model, "Elements:", elements,
         "Covariates:", n_covs, "Train:", n_train, "Test:", n_test,
-        "CPUs:", n_cpu, "Reps:", n_rep,
+        "Times:", times, "CPUs:", cpus, "Rep:", rep,
         sep = " "
     ))
 
     # Run the benchmark
-    result <- bench(model, n_elements, n_covs, n_train, n_test, n_cpu, n_rep)
+    result <- bench(
+        model, elements, n_covs, n_train,
+        n_test, times, cpus, rep
+    )
 
     print(paste("Time fit:", result$time_fit, "Time pred:", result$time_pred))
     # Save the results
@@ -412,10 +445,11 @@ main <- function(result_dir = "data/results", model_dir = "data/models") {
         dir.create(model_dir, recursive = TRUE)
     }
     filename <- paste(
-        "results_", test_type, "_", model, "_", n_elements, "_",
-        n_covs, "_", n_train, "_", n_test, "_", n_cpu, "_", n_rep,
+        "results_", test_type, "_", model, "_", elements, "_",
+        n_covs, "_", n_train, "_", n_test, "_", cpus, "_", rep,
         sep = ""
     )
+    result$parameters[["test"]] <- test_type
     write_csv(data.frame(list(
         parameters = result$parameters,
         time_fit = result$time_fit,

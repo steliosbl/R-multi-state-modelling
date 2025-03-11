@@ -165,15 +165,24 @@ hasse_tmat <- function(graph) {
 #'
 #' @param graph An igraph object representing the Hasse diagram
 #' @param n The number of walks to generate
+#' @param times The total number of distinct event times for the walks. If -1,
+#' .   there is no restriction and thus nearly every event time is unique.
 #' @param proba_layer1 The probability of starting at level 1 (the singletons)
 #'
 #' @return A list of n random walks on the Hasse diagram. Given as a dataframe
 #' .   \code{id, vertex, time}.
-hasse_walks <- function(graph, n, proba_layer1 = 0.25) {
+hasse_walks <- function(graph, n, n_times = -1, proba_layer1 = 0.25) {
     names <- V(graph)$name
     levels <- V(graph)$level
 
     walks <- list()
+
+    if (n_times != -1) {
+        unique_times <- seq(0, 1, length.out = n_times) %>%
+            head(-1) %>% # Exclude 0 and 1
+            tail(-1)
+    }
+
     for (i in 1:n) {
         # Start either at the root or a random vertex in layer 1 with
         # with probability given by proba_layer1.
@@ -213,9 +222,12 @@ hasse_walks <- function(graph, n, proba_layer1 = 0.25) {
         # For each step in the chain, assign a monotonically increasing time
         if (length(chain) == 1) {
             times <- c(0)
-        } else {
+        } else if (n_times == -1) {
             times <- sort(c(0, runif(length(chain) - 1)))
+        } else {
+            times <- sort(c(0, sample(unique_times, length(chain) - 1)))
         }
+
 
         chain_df <- data.frame(
             id = rep(i, length(chain)),
@@ -534,7 +546,7 @@ convert_hasse_msdata <- function(walks, covariates, tmat, time_max = 1.0, expand
         attr(df_msdata, "covariates") <- cov_names
         return(df_msdata)
     }
-    
+
     # Create the table of expanded covariates (do not join with states yet)
     df_covs_expanded <- df_msdata %>%
         expand.covs(cov_names, append = FALSE, longnames = TRUE)

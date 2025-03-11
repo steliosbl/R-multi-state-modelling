@@ -6,16 +6,20 @@ test1 <- function(out_name = "bench_test1.tsv") {
     param_grid <- expand.grid(
         test = "1",
         model = c("survival", "mstate", "flexsurv"),
-        n_elements = 2:4,
-        n_covariates = 4,
-        n_train = c(2^9, 2^10, 2^11, 2^12, 2^13, 2^14, 2^15),
-        n_test = 32,
-        n_cpu = 1,
+        elements = 2:4,
+        n_covs = 4,
+        n_train = 2^(11:16),
+        n_test = 16,
+        times = -1,
+        cpus = 1,
         rep = 1:3
     ) %>%
         arrange(n_train) %>%
         mutate(row = row_number()) %>%
-        select(row, test, model, n_elements, n_covariates, n_train, n_test, n_cpu, rep)
+        select(
+            row, test, model, elements, n_covs,
+            n_train, n_test, times, cpus, rep
+        )
 }
 
 # Test 2 - Fit Scaling  ########################################################
@@ -23,47 +27,62 @@ test2 <- function(out_name = "bench_test2.tsv") {
     param_grid <- expand.grid(
         test = "2",
         model = c("survival", "mstate", "flexsurv"),
-        n_elements = 2:4,
-        n_covariates = c(2, 4, 8, 16),
-        n_train = c(2^9, 2^10, 2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17, 2^18, 2^19),
+        elements = 2:4,
+        n_covs = c(2, 4, 8, 16),
+        n_train = 2^(11:21),
         n_test = 0,
-        n_cpu = 1,
+        times = -1,
+        cpus = 1,
         rep = 1:3
     ) %>%
         arrange(n_train) %>%
         mutate(row = row_number()) %>%
-        select(row, test, model, n_elements, n_covariates, n_train, n_test, n_cpu, rep)
+        select(
+            row, test, model, elements, n_covs,
+            n_train, n_test, times, cpus, rep
+        )
 }
 
 # Test 3 - Prediction Parallelism ##############################################
 test3 <- function() {
-    n_test <- c(2^4, 2^5, 2^6, 2^7, 2^8, 2^9, 2^10)
-    n_cpu <- c(2^0, 2^1, 2^2, 2^3, 2^4, 2^5, 2^6)
-
-    fixed_params <- list(
+    param_grid <- expand.grid(
         test = "3",
         model = c("survival", "mstate", "flexsurv"),
-        n_elements = 2:3,
-        n_covariates = 4,
+        elements = 2:3,
+        n_covs = 4,
         n_train = 2^13,
+        n_test = c(2^4, 2^5, 2^6, 2^7, 2^8, 2^9, 2^10),
+        times = -1,
+        cpus = c(2^0, 2^1, 2^2, 2^3, 2^4, 2^5, 2^6),
         rep = 1:3
-    )
+    ) %>%
+        arrange(cpus) %>%
+        mutate(row = row_number()) %>%
+        select(
+            row, test, model, elements, n_covs,
+            n_train, n_test, times, cpus, rep
+        )
+}
 
-    param_grids <- list()
-    for (i in seq_along(n_test)) {
-        param_grids[[i]] <- do.call(
-            expand.grid,
-            c(
-                fixed_params,
-                n_test = n_test[i],
-                n_cpu = n_cpu[i]
-            )
-        ) %>%
-            arrange(n_train) %>%
-            mutate(row = row_number()) %>%
-            select(row, test, model, n_elements, n_covariates, n_train, n_test, n_cpu, rep)
-    }
-    param_grids
+# Test 4 - Coarsening ##########################################################
+test4 <- function() {
+    param_grid <- expand.grid(
+        test = "4",
+        model = c("survival", "mstate", "flexsurv"),
+        elements = 3,
+        n_covs = 4,
+        n_train = 2^12,
+        n_test = c(2^4, 2^5, 2^6, 2^7),
+        times = 2^(4:19),
+        cpus = 1,
+        rep = 1:3
+    ) %>%
+        arrange(cpus) %>%
+        mutate(row = row_number()) %>%
+        select(
+            row, test, model, elements, n_covs,
+            n_train, n_test, times, cpus, rep
+        )
 }
 
 export_tsv <- function(param_grid, out_name, out_dir = "data/config") {
@@ -71,12 +90,14 @@ export_tsv <- function(param_grid, out_name, out_dir = "data/config") {
         dir.create(out_dir, recursive = TRUE)
     }
     out_path <- file.path(out_dir, out_name)
-    write.table(param_grid, out_path, sep = "\t", row.names = FALSE, quote = FALSE)
+    write.table(
+        param_grid, out_path,
+        sep = "\t",
+        row.names = FALSE, quote = FALSE
+    )
 }
 
-export_tsv(test1(), "bench_test1.tsv")
-export_tsv(test2(), "bench_test2.tsv")
-parallel_param_grids <- test3()
-lapply(seq_along(parallel_param_grids), function(i) {
-    export_tsv(parallel_param_grids[[i]], glue("bench_test3_{2^(i-1)}.tsv"))
-})
+export_tsv(test1(), "test1.tsv")
+export_tsv(test2(), "test2.tsv")
+export_tsv(test3(), "test3.tsv")
+export_tsv(test4(), "test4.tsv")
