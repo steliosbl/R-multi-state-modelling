@@ -1,0 +1,214 @@
+---
+title: "Benchmark Results"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# GitHub Documents
+
+This is an R Markdown format used for publishing markdown documents to GitHub. When you click the **Knit** button all R code chunks are run and a markdown file (.md) suitable for publishing to GitHub is generated.
+
+## 0. Setup 
+```{r}
+library(tidyverse)
+library(cowplot)
+
+# Import results
+results_df <- read_csv("data/results/combined_results.csv")
+```
+
+## 1. Test 1 - Varying Fit Size for Fixed Prediction Size
+```{r}
+results_test1 <- results_df %>%
+    filter(test == 1) %>%
+    filter(elements %in% c(2, 3)) %>%
+    filter(n_train > 2^9)
+
+func_log2 <- function(x) paste0("2^", log2(as.numeric(x)))
+
+results_test1 %>%
+    ggplot(aes(
+        x = n_train,
+        y = time_pred,
+        color = model
+    )) +
+    geom_point(size = 3) +
+    facet_wrap(~elements) +
+    scale_x_continuous(
+        breaks = unique(results_test1$n_train),
+        trans = "log2",
+        labels = func_log2
+    ) +
+    labs(
+        x = "Number of Training Samples",
+        y = "Fit Time (sec)",
+        color = "Model",
+        title = "Test 1: Increasing Fitting Size for Fixed Prediction Size"
+    ) +
+    theme_cowplot() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+ggsave("test1_plot.pdf", width = 12, height = 7, units = "in")
+```
+
+## 2. Test 2 - Increasing Fit Size
+```{r}
+results_test2 <- results_df %>%
+    filter(test == 2)
+
+results_test2 %>%
+    ggplot(aes(
+        x = as.factor(n_train),
+        y = as.factor(n_covs),
+        fill = time_fit
+    )) +
+    geom_tile() +
+    scale_x_discrete(
+        labels = func_log2
+    ) +
+    facet_grid(
+        elements ~ model,
+        labeller = labeller(
+            elements = as_labeller(c(
+                "2" = "2 Elements",
+                "3" = "3 Elements",
+                "4" = "4 Elements",
+                "5" = "5 Elements"
+            )), model = label_value
+        )
+    ) +
+    scale_fill_viridis_c(option = "plasma") +
+    labs(
+        x = "Number of Training Samples",
+        y = "Number of Covariates",
+        fill = "Fit Time (sec)",
+        title = "Test 2: Increasing Fit Size"
+    ) +
+    theme_cowplot()
+```
+
+## 3. Test 3 - Prediction Parallelisation
+### 3.1 Weak Scaling 
+```{r}
+results_test31 <- results_df %>%
+    filter(test == 3 & time_pred != -1) %>%
+    filter((n_test / cpus) == 16) %>%
+    group_by(model, elements, n_covs) %>%
+    mutate(t1 = mean(time_pred[cpus == 1], na.rm = TRUE)) %>%
+    ungroup() %>%
+    group_by(model, elements, n_covs, cpus) %>%
+    mutate(tn = mean(time_pred), na.rm = TRUE) %>%
+    ungroup() %>%
+    mutate(efficiency = t1 / tn) %>%
+    filter(elements == 2)
+
+results_test31 %>%
+    ggplot(aes(
+        x = cpus,
+        y = efficiency,
+        color = model
+    )) +
+    facet_wrap(~elements) +
+    geom_line(size = 1) +
+    scale_x_continuous(
+        breaks = unique(results_test31$cpus),
+        trans = "log2", labels = func_log2
+    ) +
+    geom_hline(
+        aes(yintercept = 1, color = "ideal"),
+        linetype = "dashed", size = 1, color = "gray"
+    ) +
+    labs(
+        x = "Number of CPUs",
+        y = "Efficiency",
+        color = "Model",
+        title = "Test 3.1: Weak Scaling"
+    ) +
+    theme_cowplot()
+ggsave("test31_plot.pdf", width = 12, height = 7, units = "in")
+```
+
+### 3.2 Strong Scaling
+```{r}
+results_test32 <- results_df %>%
+    filter(test == 3 & time_pred != -1) %>%
+    group_by(model, elements, n_covs) %>%
+    mutate(t1 = mean(time_pred[cpus == 1], na.rm = TRUE)) %>%
+    ungroup() %>%
+    group_by(model, elements, n_covs, cpus) %>%
+    mutate(tn = mean(time_pred), na.rm = TRUE) %>%
+    ungroup() %>%
+    mutate(efficiency = t1 / tn) %>%
+    filter(!is.na(efficiency))
+
+p_values <- seq(2^0, 2^6, by = 1) # Range of CPUs
+amdahl <- function(p, f) {
+    1 / ((1 - f) + (f / p))
+}
+amdahl_curves <- rbind(
+    data.frame(p = p_values, speedup = amdahl(p_values, 0.96), f = "f = 0.96"),
+    data.frame(p = p_values, speedup = amdahl(p_values, 0.90), f = "f = 0.90"),
+    data.frame(p = p_values, speedup = amdahl(p_values, 0.45), f = "f = 0.55"),
+    data.frame(p = p_values, speedup = amdahl(p_values, 1), f = "f = 1.0")
+)
+
+results_test32 %>%
+    ggplot(aes(
+        x = cpus,
+        y = efficiency,
+        color = model
+    )) +
+    facet_wrap(~elements) +
+    geom_line(size = 1) +
+    geom_line(
+        data = amdahl_curves,
+        aes(x = p, y = speedup, linetype = f),
+        color = "gray"
+    ) +
+    scale_linetype_manual(values = c("dashed", "dashed", "dashed", "dashed")) +
+    scale_x_continuous(
+        breaks = unique(results_test32$cpus),
+        trans = "log2"
+    ) +
+    labs(
+        x = "Number of CPUs",
+        y = "Efficiency",
+        color = "Model",
+        title = "Test 3.2: Strong Scaling"
+    ) +
+    theme_cowplot()
+ggsave("test32_plot.pdf", width = 12, height = 7, units = "in")
+```
+
+# 4. Test 4 - Coarsening 
+```{r}
+results_test4 <- results_df %>%
+    filter(test == 4)
+
+results_test4 %>%
+    ggplot(aes(
+        x = times,
+        y = time_pred,
+        color = as.factor(n_test)
+    )) +
+    geom_point(size = 3) +
+    facet_wrap(~model, scales = "free_y", nrow = 3) +
+    scale_x_continuous(
+        breaks = unique(results_test4$times),
+        trans = "log2",
+        labels = func_log2
+    ) +
+    labs(
+        x = "Number of Distinct Event Times",
+        y = "Fit Time (sec)",
+        color = "N(Pred)",
+        title = "Test 4: Increasing Number of Distinct Event Times"
+    ) +
+    theme_cowplot() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+ggsave("test4_plot.pdf", width = 12, height = 7, units = "in")
+```

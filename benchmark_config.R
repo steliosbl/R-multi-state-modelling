@@ -71,13 +71,13 @@ test4 <- function() {
         model = c("survival", "mstate", "flexsurv"),
         elements = 3,
         n_covs = 4,
-        n_train = 2^12,
-        n_test = c(2^4, 2^5, 2^6, 2^7),
+        n_train = 2^14,
+        n_test = c(2^4, 2^6),
         times = 2^(4:19),
         cpus = 1,
         rep = 1:3
     ) %>%
-        arrange(cpus) %>%
+        arrange(times) %>%
         mutate(row = row_number()) %>%
         select(
             row, test, model, elements, n_covs,

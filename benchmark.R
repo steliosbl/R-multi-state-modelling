@@ -264,28 +264,31 @@ pipeline_flexsurv <- function(walks, covariates, tmat,
             {
                 print(paste("Fitting flexsurvspline with", k, "knots"))
                 fit <- fit_flexsurv(df_train, tmat, knots = k)
+
+                # 3. Predict
+                if (n_test > 0) {
+                    pred <- predict_parallel(
+                        function(df) {
+                            predict_flexsurv(
+                                fit$model, df, tmat, tgrid
+                            )
+                        },
+                        df_test, cpus
+                    )
+                } else {
+                    pred <- list(predictions = NULL, time = 0)
+                }
                 break
             },
             error = function(e) {
                 msg <- conditionMessage(e)
-                err_vmin <- grepl("initial value in 'vmmin' is not finite", msg)
-                if (!err_vmin || k == 1) {
+                if (k == 1) {
                     stop(e)
                 }
                 print(msg)
             }
         )
         k <- k - 1
-    }
-
-    # 3. Predict
-    if (n_test > 0) {
-        pred <- predict_parallel(
-            function(df) predict_flexsurv(fit$model, df, tmat, tgrid),
-            df_test, cpus
-        )
-    } else {
-        pred <- list(predictions = NULL, time = 0)
     }
 
     list(
@@ -430,12 +433,15 @@ main <- function(result_dir = "data/results", model_dir = "data/models") {
     ))
 
     # Run the benchmark
+    time_start <- Sys.time()
     result <- bench(
         model, elements, n_covs, n_train,
         n_test, times, cpus, rep
     )
+    time_stop <- Sys.time()
 
     print(paste("Time fit:", result$time_fit, "Time pred:", result$time_pred))
+    print(paste("Total benchmark time:", time_stop - time_start))
     # Save the results
     print("Saving results")
     if (!dir.exists(result_dir)) {
@@ -446,7 +452,7 @@ main <- function(result_dir = "data/results", model_dir = "data/models") {
     }
     filename <- paste(
         "results_", test_type, "_", model, "_", elements, "_",
-        n_covs, "_", n_train, "_", n_test, "_", cpus, "_", rep,
+        n_covs, "_", n_train, "_", n_test, "_", times, "_", cpus, "_", rep,
         sep = ""
     )
     result$parameters[["test"]] <- test_type

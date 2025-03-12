@@ -13,7 +13,7 @@
 #SBATCH --array=1-1188                       # Array of jobs
 
 # Specify the path to the config file
-config=/rds/user/sb2690/hpc-work/R-multi-state-modelling/data/config/bench_test2.tsv
+config=/rds/user/sb2690/hpc-work/R-multi-state-modelling/data/config/test2.tsv
 
 # Extract the parameters for the current $SLURM_ARRAY_TASK_ID
 ptest=$(awk -v ArrayTaskID=$SLURM_ARRAY_TASK_ID '$1==ArrayTaskID {print $2}' $config)
